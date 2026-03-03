@@ -549,6 +549,31 @@ class SMPLXToG1Retargeter:
         delta_R = twist_angle_about_axis(R_e_g1_R, self.elbow_axis_R.to(device))
         q[:, 25] = math.pi / 2 + delta_R
 
+        # --- Left wrist ---
+        # Chain: SMPL-X forearm = collar @ shoulder @ elbow
+        R_smplx_forearm_L = R_s_L @ body_rotmats[:, 17]
+        # Chain: G1 forearm = G1 shoulder total @ G1 elbow rotation
+        R_elbow_mat_L = rot_axis_angle(
+            self.elbow_axis_L.to(device), q[:, 18],
+        )
+        R_g1_forearm_L = R_total_L @ R_elbow_mat_L
+        # Frame change and decompose
+        M_wL = R_g1_forearm_L.transpose(-1, -2) @ R_G_S.to(device) @ R_smplx_forearm_L
+        R_w_g1_L = M_wL @ body_rotmats[:, 19] @ M_wL.transpose(-1, -2)
+        th = sequential_decompose(R_w_g1_L, [a.to(device) for a in self.wrist_axes_L])
+        q[:, 19], q[:, 20], q[:, 21] = th[0], th[1], th[2]
+
+        # --- Right wrist ---
+        R_smplx_forearm_R = R_s_R @ body_rotmats[:, 18]
+        R_elbow_mat_R = rot_axis_angle(
+            self.elbow_axis_R.to(device), q[:, 25],
+        )
+        R_g1_forearm_R = R_total_R @ R_elbow_mat_R
+        M_wR = R_g1_forearm_R.transpose(-1, -2) @ R_G_S.to(device) @ R_smplx_forearm_R
+        R_w_g1_R = M_wR @ body_rotmats[:, 20] @ M_wR.transpose(-1, -2)
+        th = sequential_decompose(R_w_g1_R, [a.to(device) for a in self.wrist_axes_R])
+        q[:, 26], q[:, 27], q[:, 28] = th[0], th[1], th[2]
+
         # Clamp using URDF body limits (from output vectors)
         q_full = torch.zeros(B, NUM_TOTAL, device=device)
         q_full[:, :NUM_BODY] = q
