@@ -512,28 +512,33 @@ class SMPLXToG1Retargeter:
         th = sequential_decompose(R_spine, [a.to(device) for a in self.waist_axes])
         q[:, 12], q[:, 13], q[:, 14] = th[0], th[1], th[2]
 
-        # --- Left shoulder: collar folded + stand-down ---
-        # collar: R[:,12], shoulder: R[:,15]
-        R_arm_L = _R_STAND_L_G1_T.to(device) @ (R[:, 12] @ R[:, 15])
-        th = sequential_decompose(R_arm_L, [a.to(device) for a in self.shoulder_axes_L])
+        # --- Left shoulder ---
+        # Combine collar (idx 12) + shoulder (idx 15) in SMPL-X frame,
+        # basis-swap to G1 torso frame, then compose with T-pose base.
+        R_s_L = body_rotmats[:, 12] @ body_rotmats[:, 15]
+        R_g1_L = R_G_S.to(device) @ R_s_L @ R_G_S_T.to(device)
+        R_tpose_L = rot_axis_angle(
+            self.joint_info["left_shoulder_roll_joint"].axis.to(device),
+            torch.tensor([math.pi / 2], device=device),
+        ).expand(B, -1, -1)
+        R_total_L = R_g1_L @ R_tpose_L
+        th = sequential_decompose(R_total_L, [a.to(device) for a in self.shoulder_axes_L])
         q[:, 15], q[:, 16], q[:, 17] = th[0], th[1], th[2]
 
-        # elbow: R[:,17]
-        q[:, 18] = twist_angle_about_axis(R[:, 17], self.elbow_axis_L.to(device))
-
-        # wrist: R[:,19]
-        th = sequential_decompose(R[:, 19], [a.to(device) for a in self.wrist_axes_L])
-        q[:, 19], q[:, 20], q[:, 21] = th[0], th[1], th[2]
-
         # --- Right shoulder ---
-        R_arm_R = _R_STAND_R_G1_T.to(device) @ (R[:, 13] @ R[:, 16])
-        th = sequential_decompose(R_arm_R, [a.to(device) for a in self.shoulder_axes_R])
+        R_s_R = body_rotmats[:, 13] @ body_rotmats[:, 16]
+        R_g1_R = R_G_S.to(device) @ R_s_R @ R_G_S_T.to(device)
+        R_tpose_R = rot_axis_angle(
+            self.joint_info["right_shoulder_roll_joint"].axis.to(device),
+            torch.tensor([-math.pi / 2], device=device),
+        ).expand(B, -1, -1)
+        R_total_R = R_g1_R @ R_tpose_R
+        th = sequential_decompose(R_total_R, [a.to(device) for a in self.shoulder_axes_R])
         q[:, 22], q[:, 23], q[:, 24] = th[0], th[1], th[2]
 
-        q[:, 25] = twist_angle_about_axis(R[:, 18], self.elbow_axis_R.to(device))
-
-        th = sequential_decompose(R[:, 20], [a.to(device) for a in self.wrist_axes_R])
-        q[:, 26], q[:, 27], q[:, 28] = th[0], th[1], th[2]
+        # --- Elbows: fixed T-pose offset (TODO: retarget) ---
+        q[:, 18] = math.pi / 2     # left elbow
+        q[:, 25] = math.pi / 2     # right elbow
 
         # Clamp using URDF body limits (from output vectors)
         q_full = torch.zeros(B, NUM_TOTAL, device=device)
@@ -542,81 +547,9 @@ class SMPLXToG1Retargeter:
         return q_full[:, :NUM_BODY]
 
     def _retarget_hand(self, hand_rotmats: torch.Tensor, side: str) -> torch.Tensor:
-        """
-        hand_rotmats: (B,15,3,3) SMPL-X hand local rotations
-        Returns: (B,12) Inspire targets using URDF axis sign per joint.
-        """
+        """TODO: rewrite hand retargeting."""
         B = hand_rotmats.shape[0]
-        device = hand_rotmats.device
-        R = conjugate_global_basis(hand_rotmats)
-
-        # Helper: hinge angle around URDF joint axis
-        def hinge(rot: torch.Tensor, joint_name: str) -> torch.Tensor:
-            axis = self.joint_info[joint_name].axis.to(device)
-            return twist_angle_about_axis(rot, axis)
-
-        q = torch.zeros(B, 12, device=device)
-
-        if side == "left":
-            # Thumb: SMPL thumb joints are 12,13,14 (3 joints); robot has 4
-            # Deterministic mapping:
-            #   thumb_1 <- thumb1 (12)
-            #   thumb_2 <- thumb2 (13)
-            #   thumb_3 <- thumb2 (13)  (shared; refine later if you have better kinematics)
-            #   thumb_4 <- thumb3 (14)
-            q[:, 0] = hinge(R[:, 12], "left_thumb_1_joint")
-            q[:, 1] = hinge(R[:, 13], "left_thumb_2_joint")
-            q[:, 2] = hinge(R[:, 13], "left_thumb_3_joint")
-            q[:, 3] = hinge(R[:, 14], "left_thumb_4_joint")
-
-            # Index: use proximal + middle
-            q[:, 4] = hinge(R[:, 0], "left_index_1_joint")
-            q[:, 5] = hinge(R[:, 1], "left_index_2_joint")
-
-            # Middle
-            q[:, 6] = hinge(R[:, 3], "left_middle_1_joint")
-            q[:, 7] = hinge(R[:, 4], "left_middle_2_joint")
-
-            # Ring
-            q[:, 8] = hinge(R[:, 9], "left_ring_1_joint")
-            q[:, 9] = hinge(R[:, 10], "left_ring_2_joint")
-
-            # Little (pinky)
-            q[:, 10] = hinge(R[:, 6], "left_little_1_joint")
-            q[:, 11] = hinge(R[:, 7], "left_little_2_joint")
-
-            # Inspire is [0,max] => clamp negatives to 0
-            q = torch.clamp(q, min=0.0)
-
-        else:
-            q[:, 0] = hinge(R[:, 12], "right_thumb_1_joint")
-            q[:, 1] = hinge(R[:, 13], "right_thumb_2_joint")
-            q[:, 2] = hinge(R[:, 13], "right_thumb_3_joint")
-            q[:, 3] = hinge(R[:, 14], "right_thumb_4_joint")
-
-            q[:, 4] = hinge(R[:, 0], "right_index_1_joint")
-            q[:, 5] = hinge(R[:, 1], "right_index_2_joint")
-
-            q[:, 6] = hinge(R[:, 3], "right_middle_1_joint")
-            q[:, 7] = hinge(R[:, 4], "right_middle_2_joint")
-
-            q[:, 8] = hinge(R[:, 9], "right_ring_1_joint")
-            q[:, 9] = hinge(R[:, 10], "right_ring_2_joint")
-
-            q[:, 10] = hinge(R[:, 6], "right_little_1_joint")
-            q[:, 11] = hinge(R[:, 7], "right_little_2_joint")
-
-            q = torch.clamp(q, min=0.0)
-
-        # Final clamp to URDF limits for those joints
-        # We clamp using the global output vectors:
-        q_full = torch.zeros(B, NUM_TOTAL, device=device)
-        if side == "left":
-            q_full[:, 29:41] = q
-        else:
-            q_full[:, 41:53] = q
-        q_full = self._clamp(q_full)
-        return q_full[:, 29:41] if side == "left" else q_full[:, 41:53]
+        return torch.zeros(B, 12, device=hand_rotmats.device)
 
     def __call__(
         self,

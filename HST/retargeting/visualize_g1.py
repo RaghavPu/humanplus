@@ -277,13 +277,30 @@ def visualize(
 
     data = mujoco.MjData(model)
 
-    # qpos layout:  [0:3] translation, [3:7] quat wxyz, [7:60] 53 joints
+    # Build qpos index map: JOINT_NAMES order -> actual MuJoCo qposadr
+    from HST.retargeting.smplx_to_g1 import JOINT_NAMES
+    qpos_indices = []
+    print("\nMuJoCo qpos mapping (JOINT_NAMES idx -> qposadr):")
+    for i, jname in enumerate(JOINT_NAMES):
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        if jid < 0:
+            print(f"  WARNING: joint '{jname}' not found in MuJoCo model")
+            qpos_indices.append(None)
+            continue
+        addr = model.jnt_qposadr[jid]
+        expected = 7 + i
+        flag = "" if addr == expected else f"  *** MISMATCH (expected {expected}) ***"
+        print(f"  [{i:2d}] {jname:40s}  qposadr={addr:3d}{flag}")
+        qpos_indices.append(addr)
+
     def set_frame(k: int):
         r = root[k]
         q = joints[k]
         data.qpos[0:3] = r[0:3]
         data.qpos[3:7] = r[3:7]
-        data.qpos[7:7 + 53] = q
+        for i, addr in enumerate(qpos_indices):
+            if addr is not None:
+                data.qpos[addr] = q[i]
         mujoco.mj_forward(model, data)
 
     dt = 1.0 / fps
