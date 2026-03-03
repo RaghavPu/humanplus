@@ -563,6 +563,12 @@ class SMPLXToG1Retargeter:
         th = sequential_decompose(R_w_g1_L, [a.to(device) for a in self.wrist_axes_L])
         q[:, 19], q[:, 20], q[:, 21] = th[0], th[1], th[2]
 
+        # Hand frame change: chain forearm + wrist
+        R_smplx_hand_L = R_smplx_forearm_L @ body_rotmats[:, 19]
+        R_g1_wrist_mat_L = R_w_g1_L  # already the wrist rotation in G1 forearm frame
+        R_g1_hand_L = R_g1_forearm_L @ R_g1_wrist_mat_L
+        M_hand_L = R_g1_hand_L.transpose(-1, -2) @ R_G_S.to(device) @ R_smplx_hand_L
+
         # --- Right wrist ---
         R_smplx_forearm_R = R_s_R @ body_rotmats[:, 18]
         R_elbow_mat_R = rot_axis_angle(
@@ -574,16 +580,73 @@ class SMPLXToG1Retargeter:
         th = sequential_decompose(R_w_g1_R, [a.to(device) for a in self.wrist_axes_R])
         q[:, 26], q[:, 27], q[:, 28] = th[0], th[1], th[2]
 
+        # Hand frame change: chain forearm + wrist
+        R_smplx_hand_R = R_smplx_forearm_R @ body_rotmats[:, 20]
+        R_g1_hand_R = R_g1_forearm_R @ R_w_g1_R
+        M_hand_R = R_g1_hand_R.transpose(-1, -2) @ R_G_S.to(device) @ R_smplx_hand_R
+
         # Clamp using URDF body limits (from output vectors)
         q_full = torch.zeros(B, NUM_TOTAL, device=device)
         q_full[:, :NUM_BODY] = q
         q_full = self._clamp(q_full)
-        return q_full[:, :NUM_BODY]
+        return q_full[:, :NUM_BODY], M_hand_L, M_hand_R
 
-    def _retarget_hand(self, hand_rotmats: torch.Tensor, side: str) -> torch.Tensor:
-        """TODO: rewrite hand retargeting."""
+    # SMPL-X hand joint index -> (Inspire joint offset, URDF joint name) per side
+    _FINGER_MAP_LEFT: List[Tuple[int, str]] = [
+        (12, "left_thumb_1_joint"),
+        (13, "left_thumb_2_joint"),
+        (13, "left_thumb_3_joint"),   # shared with thumb_2
+        (14, "left_thumb_4_joint"),
+        (0,  "left_index_1_joint"),
+        (1,  "left_index_2_joint"),
+        (3,  "left_middle_1_joint"),
+        (4,  "left_middle_2_joint"),
+        (9,  "left_ring_1_joint"),
+        (10, "left_ring_2_joint"),
+        (6,  "left_little_1_joint"),
+        (7,  "left_little_2_joint"),
+    ]
+    _FINGER_MAP_RIGHT: List[Tuple[int, str]] = [
+        (12, "right_thumb_1_joint"),
+        (13, "right_thumb_2_joint"),
+        (13, "right_thumb_3_joint"),
+        (14, "right_thumb_4_joint"),
+        (0,  "right_index_1_joint"),
+        (1,  "right_index_2_joint"),
+        (3,  "right_middle_1_joint"),
+        (4,  "right_middle_2_joint"),
+        (9,  "right_ring_1_joint"),
+        (10, "right_ring_2_joint"),
+        (6,  "right_little_1_joint"),
+        (7,  "right_little_2_joint"),
+    ]
+
+    def _retarget_hand(
+        self, hand_rotmats: torch.Tensor, side: str, M_hand: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        hand_rotmats: (B,15,3,3) SMPL-X hand local rotations
+        M_hand: (B,3,3) frame change from SMPL-X wrist frame to G1 wrist frame
+        Returns: (B,12) Inspire joint angles, clamped to [0, max].
+        """
         B = hand_rotmats.shape[0]
-        return torch.zeros(B, 12, device=hand_rotmats.device)
+        device = hand_rotmats.device
+        fmap = self._FINGER_MAP_LEFT if side == "left" else self._FINGER_MAP_RIGHT
+
+        q = torch.zeros(B, 12, device=device)
+        Mt = M_hand.transpose(-1, -2)
+
+        for out_idx, (smplx_idx, joint_name) in enumerate(fmap):
+            R_f_g1 = M_hand @ hand_rotmats[:, smplx_idx] @ Mt
+            axis = self.joint_info[joint_name].axis.to(device)
+            q[:, out_idx] = twist_angle_about_axis(R_f_g1, axis).abs()
+
+        # Clamp to URDF limits
+        q_full = torch.zeros(B, NUM_TOTAL, device=device)
+        offset = 29 if side == "left" else 41
+        q_full[:, offset:offset + 12] = q
+        q_full = self._clamp(q_full)
+        return q_full[:, offset:offset + 12]
 
     def __call__(
         self,
@@ -605,14 +668,14 @@ class SMPLXToG1Retargeter:
             body_pose = body_pose.reshape(B, 21, 3)
 
         body_rotmats = axis_angle_to_rotmat(body_pose)  # (B,21,3,3)
-        q_body = self._retarget_body(body_rotmats)       # (B,29)
+        q_body, M_hand_L, M_hand_R = self._retarget_body(body_rotmats)
 
         if left_hand_pose is not None:
             lh = left_hand_pose.to(self.device)
             if lh.ndim == 2:
                 lh = lh.reshape(B, 15, 3)
             lh_R = axis_angle_to_rotmat(lh)
-            q_lh = self._retarget_hand(lh_R, "left")
+            q_lh = self._retarget_hand(lh_R, "left", M_hand_L)
         else:
             q_lh = torch.zeros(B, 12, device=self.device)
 
@@ -621,7 +684,7 @@ class SMPLXToG1Retargeter:
             if rh.ndim == 2:
                 rh = rh.reshape(B, 15, 3)
             rh_R = axis_angle_to_rotmat(rh)
-            q_rh = self._retarget_hand(rh_R, "right")
+            q_rh = self._retarget_hand(rh_R, "right", M_hand_R)
         else:
             q_rh = torch.zeros(B, 12, device=self.device)
 
