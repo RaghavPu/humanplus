@@ -536,9 +536,18 @@ class SMPLXToG1Retargeter:
         th = sequential_decompose(R_total_R, [a.to(device) for a in self.shoulder_axes_R])
         q[:, 22], q[:, 23], q[:, 24] = th[0], th[1], th[2]
 
-        # --- Elbows: fixed T-pose offset (TODO: retarget) ---
-        q[:, 18] = math.pi / 2     # left elbow
-        q[:, 25] = math.pi / 2     # right elbow
+        # --- Left elbow ---
+        # Frame change: SMPL-X arm frame -> G1 arm frame using actual shoulder
+        M_L = R_total_L.transpose(-1, -2) @ R_G_S.to(device) @ R_s_L
+        R_e_g1_L = M_L @ body_rotmats[:, 17] @ M_L.transpose(-1, -2)
+        delta_L = twist_angle_about_axis(R_e_g1_L, self.elbow_axis_L.to(device))
+        q[:, 18] = math.pi / 2 + delta_L
+
+        # --- Right elbow ---
+        M_R = R_total_R.transpose(-1, -2) @ R_G_S.to(device) @ R_s_R
+        R_e_g1_R = M_R @ body_rotmats[:, 18] @ M_R.transpose(-1, -2)
+        delta_R = twist_angle_about_axis(R_e_g1_R, self.elbow_axis_R.to(device))
+        q[:, 25] = math.pi / 2 + delta_R
 
         # Clamp using URDF body limits (from output vectors)
         q_full = torch.zeros(B, NUM_TOTAL, device=device)
